@@ -776,8 +776,11 @@ def akc_values(crop: Crop) -> Dict[str, float]:
 def compute_phase_kc_akc(crop: Crop, dap: int) -> Tuple[str, float, float]:
     limits = stage_limits(crop)
 
-    # incremento diário da fase inicial até o kc_cv
-    akc_inicial = 0.02
+    # incremento da fase inicial (crescimento linear até kc_cv)
+    akc_inicial = (
+        (crop.kc_cv - crop.kc_in) / crop.duracao_in
+        if crop.duracao_in > 0 else 0.0
+    )
 
     if dap <= limits["fim_in"]:
         fase = "inicial"
@@ -787,10 +790,17 @@ def compute_phase_kc_akc(crop: Crop, dap: int) -> Tuple[str, float, float]:
 
     elif dap <= limits["fim_cv"]:
         fase = "desenvolvimento"
+
+        # último valor da fase inicial
         kc_inicio_desenvolvimento = crop.kc_in + akc_inicial * (crop.duracao_in - 1)
+
         dias_na_fase = dap - limits["fim_in"]
-        restante_dias = max(crop.duracao_cv, 1)
-        akc_cv = (crop.kc_m - kc_inicio_desenvolvimento) / restante_dias
+
+        akc_cv = (
+            (crop.kc_m - kc_inicio_desenvolvimento) / crop.duracao_cv
+            if crop.duracao_cv > 0 else 0.0
+        )
+
         kc = kc_inicio_desenvolvimento + akc_cv * dias_na_fase
         akc_usado = akc_cv
 
@@ -802,7 +812,12 @@ def compute_phase_kc_akc(crop: Crop, dap: int) -> Tuple[str, float, float]:
     elif dap <= limits["fim_final"]:
         fase = "final"
         dias_na_fase = dap - limits["fim_medio"]
-        akc_final = (crop.kc_final - crop.kc_m) / crop.duracao_final if crop.duracao_final > 0 else 0.0
+
+        akc_final = (
+            (crop.kc_final - crop.kc_m) / crop.duracao_final
+            if crop.duracao_final > 0 else 0.0
+        )
+
         kc = crop.kc_m + akc_final * dias_na_fase
         akc_usado = akc_final
 
