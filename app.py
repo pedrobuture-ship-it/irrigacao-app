@@ -569,6 +569,16 @@ def fetch_weather_open_meteo(
     return result
 
 
+def merge_weather_data_by_date(*weather_lists: List[WeatherDay]) -> List[WeatherDay]:
+    """Une listas de clima sem duplicar datas, preservando a primeira ocorrência de cada dia."""
+    merged: Dict[date, WeatherDay] = {}
+    for weather_list in weather_lists:
+        for wd in weather_list:
+            if wd.data not in merged:
+                merged[wd.data] = wd
+    return [merged[d] for d in sorted(merged.keys())]
+
+
 # ============================================================
 # CÁLCULOS AGRONÔMICOS
 # ============================================================
@@ -638,8 +648,8 @@ def build_planilha_prof_df(
         # Aqui estou usando a irrigação real do dia como "LLI aplicada"
         lli_aplicada = r.irrigacao_real_mm
 
-        # DP = depleção = DTA - LA final
-        dp = dta_mm - la_f
+        # DP = depleção acumulada do dia (Dr)
+        dp = 0.0 if r.deplecao_mm < r.raw_mm else r.deplecao_mm
 
         rows.append({
             "Data": r.data.strftime("%d/%m/%Y"),
@@ -665,6 +675,26 @@ def build_planilha_prof_df(
         })
 
     return pd.DataFrame(rows)
+
+
+def build_future_weather_data(
+    start_date: date,
+    num_days: int,
+    eto_mm: float,
+    precipitacao_mm: float,
+) -> List[WeatherDay]:
+    """Gera dados sintéticos para testar dias futuros sem esperar datas reais."""
+    future_days: List[WeatherDay] = []
+    for i in range(num_days):
+        future_days.append(
+            WeatherDay(
+                data=start_date + timedelta(days=i),
+                precipitacao_mm=float(precipitacao_mm),
+                eto_mm=float(eto_mm),
+            )
+        )
+    return future_days
+
 def compute_effective_z_m(
     crop: Crop,
     dap: int,
@@ -745,32 +775,43 @@ def akc_values(crop: Crop) -> Dict[str, float]:
 
 def compute_phase_kc_akc(crop: Crop, dap: int) -> Tuple[str, float, float]:
     limits = stage_limits(crop)
-    akc = akc_values(crop)
+
+    # incremento diário da fase inicial até o kc_cv
+    akc_inicial = 0.02
 
     if dap <= limits["fim_in"]:
         fase = "inicial"
-        kc = crop.kc_in
-        akc_usado = akc["akc_in"]
+        dias_na_fase = max(dap - 1, 0)
+        kc = crop.kc_in + akc_inicial * dias_na_fase
+        akc_usado = akc_inicial
+
     elif dap <= limits["fim_cv"]:
         fase = "desenvolvimento"
+        kc_inicio_desenvolvimento = crop.kc_in + akc_inicial * (crop.duracao_in - 1)
         dias_na_fase = dap - limits["fim_in"]
-        kc = crop.kc_cv + akc["akc_cv"] * dias_na_fase
-        akc_usado = akc["akc_cv"]
+        restante_dias = max(crop.duracao_cv, 1)
+        akc_cv = (crop.kc_m - kc_inicio_desenvolvimento) / restante_dias
+        kc = kc_inicio_desenvolvimento + akc_cv * dias_na_fase
+        akc_usado = akc_cv
+
     elif dap <= limits["fim_medio"]:
         fase = "medio"
         kc = crop.kc_m
-        akc_usado = akc["akc_m"]
+        akc_usado = 0.0
+
     elif dap <= limits["fim_final"]:
         fase = "final"
         dias_na_fase = dap - limits["fim_medio"]
-        kc = crop.kc_m + akc["akc_final"] * dias_na_fase
-        akc_usado = akc["akc_final"]
+        akc_final = (crop.kc_final - crop.kc_m) / crop.duracao_final if crop.duracao_final > 0 else 0.0
+        kc = crop.kc_m + akc_final * dias_na_fase
+        akc_usado = akc_final
+
     else:
         fase = "apos_ciclo"
         kc = crop.kc_final
         akc_usado = 0.0
 
-    return fase, kc, akc_usado
+    return fase, round(kc, 4), round(akc_usado, 5)
 
 
 def compute_ks(dr_mm: float, taw_mm: float, raw_mm: float) -> float:
@@ -1312,24 +1353,6 @@ with aba5:
         )
         modo_calculo_calc_key = "fao56" if modo_calculo_calc == "FAO-56" else "planilha"
 
-        st.markdown("### Configuração da tabela estilo planilha")
-        c_pef1, c_pef2 = st.columns([1, 1])
-        pef_mode_label = c_pef1.selectbox(
-            "Como calcular Pef na tabela",
-            ["Igual à precipitação", "Percentual da precipitação"],
-            key="calc_pef_mode",
-        )
-        pef_mode = "igual_p" if pef_mode_label == "Igual à precipitação" else "percentual"
-        pef_percentual = c_pef2.number_input(
-            "Percentual de Pef (use 1.0 = 100%)",
-            min_value=0.0,
-            max_value=1.0,
-            value=1.0,
-            step=0.01,
-            format="%.2f",
-            key="calc_pef_percentual",
-        )
-
         if data_calculo < data_plantio:
             st.error("A data de referência não pode ser anterior à data de plantio.")
         else:
@@ -1581,27 +1604,127 @@ with aba5:
                             "Por isso ainda não há necessidade de irrigação pela regra automática."
                         )
 
-                    st.markdown("## 6. Tabela no formato da planilha")
+                    st.markdown("## 6. Simulação dos próximos dias")
+                    st.caption("Use esta área para testar o comportamento do balanço hídrico sem precisar esperar os próximos dias reais.")
 
-                    eficiencia_calc = IRRIGATION_EFFICIENCY[normalize_name(plantio["sistema_irrigacao"])]
-                    df_planilha = build_planilha_prof_df(
-                        results=resultados,
-                        soil=soil,
-                        crop=crop,
-                        eficiencia=eficiencia_calc,
-                        pef_mode=pef_mode,
-                        pef_percentual=pef_percentual,
+                    simular_futuro = st.checkbox(
+                        "Ativar simulação futura",
+                        value=False,
+                        key=f"simular_futuro_{plantio_calc_id}"
                     )
 
-                    st.dataframe(df_planilha, width="stretch")
+                    if simular_futuro:
+                        c_sim1, c_sim2, c_sim3 = st.columns(3)
+                        dias_futuros = int(c_sim1.number_input(
+                            "Quantidade de dias futuros",
+                            min_value=1,
+                            max_value=60,
+                            value=7,
+                            step=1,
+                            key=f"dias_futuros_{plantio_calc_id}"
+                        ))
+                        eto_futuro = float(c_sim2.number_input(
+                            "ETo futuro fixo (mm/dia)",
+                            min_value=0.0,
+                            value=float(r.eto_mm),
+                            step=0.1,
+                            format="%.3f",
+                            key=f"eto_futuro_{plantio_calc_id}"
+                        ))
+                        chuva_futura = float(c_sim3.number_input(
+                            "Precipitação futura fixa (mm/dia)",
+                            min_value=0.0,
+                            value=float(r.p_mm),
+                            step=0.1,
+                            format="%.3f",
+                            key=f"chuva_futura_{plantio_calc_id}"
+                        ))
 
-                    csv_planilha = df_planilha.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
-                    st.download_button(
-                        "Baixar tabela estilo planilha em CSV",
-                        data=csv_planilha,
-                        file_name=f"planilha_calculos_{plantio_calc_id}.csv",
-                        mime="text/csv",
-                    )
+                        c_sim4, c_sim5 = st.columns(2)
+                        pef_mode_sim = c_sim4.selectbox(
+                            "Como mostrar o Pef na tabela simulada",
+                            ["igual_p", "percentual"],
+                            format_func=lambda x: "Pef = P" if x == "igual_p" else "Pef = percentual da precipitação",
+                            key=f"pef_mode_sim_{plantio_calc_id}"
+                        )
+                        pef_percentual_sim = float(c_sim5.number_input(
+                            "Percentual do Pef",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=1.0,
+                            step=0.05,
+                            format="%.2f",
+                            key=f"pef_percentual_sim_{plantio_calc_id}",
+                            disabled=(pef_mode_sim != "percentual")
+                        ))
+
+                        previsao_inicio = data_calculo
+                        previsao_fim = data_calculo + timedelta(days=dias_futuros - 1)
+
+                        future_weather = fetch_weather_open_meteo(
+                            latitude=plantio["latitude"],
+                            longitude=plantio["longitude"],
+                            start_date=previsao_inicio,
+                            end_date=previsao_fim,
+                            timezone=plantio["timezone"],
+                        )
+
+                        # Junta clima já carregado com previsão futura sem duplicar datas,
+                        # preservando primeiro os dados já existentes do período atual.
+                        weather_data_expandido = merge_weather_data_by_date(weather_data, future_weather)
+
+                        resultados_expandido = simulate_irrigation(
+                            crop=crop,
+                            soil=soil,
+                            sistema_irrigacao=plantio["sistema_irrigacao"],
+                            data_plantio=data_plantio,
+                            weather_data=weather_data_expandido,
+                            z_override_m=plantio["z_override_m"],
+                            f_override=plantio["f_override"],
+                            irrigacao_real_por_dia=irrigacao_map,
+                            modo_automatico=True,
+                            modo_calculo=modo_calculo_calc_key,
+                        )
+
+                        resultados_futuros = [
+                            res for res in resultados_expandido
+                            if data_calculo <= res.data <= previsao_fim
+                        ]
+
+                        if resultados_futuros:
+                            eficiencia_sim = IRRIGATION_EFFICIENCY[normalize_name(plantio["sistema_irrigacao"])]
+                            df_sim = build_planilha_prof_df(
+                                results=resultados_futuros,
+                                soil=soil,
+                                crop=crop,
+                                eficiencia=eficiencia_sim,
+                                pef_mode=pef_mode_sim,
+                                pef_percentual=pef_percentual_sim,
+                            )
+
+                            st.write(
+                                f"Simulação usando a previsão da Open-Meteo de **{data_calculo.strftime('%d/%m/%Y')}** até "
+                                f"**{previsao_fim.strftime('%d/%m/%Y')}**."
+                            )
+                            st.dataframe(df_sim, width="stretch")
+
+                            df_sim_grafico = df_sim.copy()
+                            for col in ["DRA (mm)", "DP", "LLI", "LBI", "ETc (mm)", "Pef", "LA f"]:
+                                df_sim_grafico[col] = pd.to_numeric(df_sim_grafico[col], errors="coerce")
+                            st.line_chart(
+                                df_sim_grafico.set_index("Data")[["DP", "DRA (mm)", "LA f"]],
+                                height=320,
+                            )
+
+                            st.download_button(
+                                "Baixar simulação futura em CSV",
+                                data=df_sim.to_csv(index=False).encode("utf-8-sig"),
+                                file_name=f"simulacao_futura_plantio_{plantio_calc_id}.csv",
+                                mime="text/csv",
+                                key=f"download_sim_csv_{plantio_calc_id}"
+                            )
+                        else:
+                            st.info("Não foi possível gerar resultados futuros para a configuração atual.")
 
                     st.markdown("## 7. Fórmulas resumidas")
                     st.code(
