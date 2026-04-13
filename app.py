@@ -15,12 +15,18 @@ import streamlit as st
 # CONFIGURAÇÃO
 # ============================================================
 
+from pathlib import Path
+
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
-DATA_DIR = Path(".")
-DB_PATH = "irrigacao_streamlit.db"
+# Diretório base do projeto (onde está o app.py)
+BASE_DIR = Path(__file__).resolve().parent
+
+# Pasta de dados
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Caminho do banco
 DB_PATH = str(DATA_DIR / "irrigacao_streamlit.db")
 
 
@@ -566,6 +572,38 @@ def fetch_weather_open_meteo(
 # ============================================================
 # CÁLCULOS AGRONÔMICOS
 # ============================================================
+def compute_effective_z_m(
+    crop: Crop,
+    dap: int,
+    modo_calculo: str,
+    z_override_m: Optional[float] = None,
+) -> float:
+    """
+    Retorna o Z efetivo do dia.
+
+    modo_calculo:
+    - "fao56": usa Z fixo da cultura (ou override manual)
+    - "planilha": usa SR = 100 mm nos primeiros 10 dias, isto é, Z = 0,10 m;
+                  após isso usa o Z final da cultura (ou override manual)
+    """
+    z_final = z_override_m if z_override_m is not None else crop.z_m
+
+    if modo_calculo == "planilha":
+        if dap <= 10:
+            return 0.10  # SR = 100 mm
+        return z_final
+
+    return z_final
+
+
+def compute_kl_from_sr_mm(sr_mm: float) -> float:
+    return clamp(0.1 * math.sqrt(sr_mm), 0.0, 1.0)
+
+
+def compute_taw_mm_from_z(soil: Soil, z_m: float) -> float:
+    theta_fc = soil.ucc * soil.ds
+    theta_wp = soil.upmp * soil.ds
+    return max(0.0, 1000.0 * (theta_fc - theta_wp) * z_m)
 
 def compute_sr_mm(z_m: float) -> float:
     return z_m * 1000.0
@@ -671,18 +709,14 @@ def simulate_irrigation(
     f_override: Optional[float] = None,
     irrigacao_real_por_dia: Optional[Dict[date, float]] = None,
     modo_automatico: bool = True,
+    modo_calculo: str = "fao56",
 ) -> List[ResultDay]:
     sistema_key = normalize_name(sistema_irrigacao)
     if sistema_key not in IRRIGATION_EFFICIENCY:
         raise ValueError(f"Sistema de irrigação inválido: {sistema_irrigacao}")
 
     eficiencia = IRRIGATION_EFFICIENCY[sistema_key]
-    z_m = z_override_m if z_override_m is not None else crop.z_m
     f = f_override if f_override is not None else crop.fator_f
-
-    kl = compute_kl(z_m)
-    taw_mm = compute_taw_mm(soil, z_m)
-    raw_mm = compute_raw_mm(taw_mm, f)
 
     irrigacao_real_por_dia = irrigacao_real_por_dia or {}
 
@@ -693,6 +727,19 @@ def simulate_irrigation(
         dap = (wd.data - data_plantio).days + 1
         if dap < 1:
             continue
+
+        # Z efetivo do dia conforme o modo escolhido
+        z_m = compute_effective_z_m(
+            crop=crop,
+            dap=dap,
+            modo_calculo=modo_calculo,
+            z_override_m=z_override_m,
+        )
+
+        sr_mm = compute_sr_mm(z_m)
+        kl = compute_kl_from_sr_mm(sr_mm)
+        taw_mm = compute_taw_mm_from_z(soil, z_m)
+        raw_mm = compute_raw_mm(taw_mm, f)
 
         fase, kc, akc = compute_phase_kc_akc(crop, dap)
         ks = compute_ks(dr_mm, taw_mm, raw_mm)
@@ -875,6 +922,14 @@ with aba2:
         data_operacao = c1.date_input("Data da operação", value=date.today())
         modo_auto = c2.checkbox("Mostrar recomendação automática (LLI/LBI)", value=True)
 
+        modo_calculo = st.radio(
+            "Modo de cálculo",
+            ["FAO-56", "Planilha"],
+            horizontal=True,
+            help="FAO-56 usa Z fixo da cultura. Planilha usa SR = 100 mm (Z = 0,10 m) nos primeiros 10 dias."
+        )
+        modo_calculo_key = "fao56" if modo_calculo == "FAO-56" else "planilha"
+
         ultimo_dia = get_last_saved_day(plantio_id)
 
         st.markdown("### Estado anterior")
@@ -911,6 +966,7 @@ with aba2:
                     f_override=plantio["f_override"],
                     irrigacao_real_por_dia=irrigacao_map,
                     modo_automatico=modo_auto,
+                    modo_calculo=modo_calculo_key,
                 )
 
                 if not resultados_antes:
@@ -927,6 +983,7 @@ with aba2:
                     st.markdown("### Resumo do dia")
                     resumo_df = pd.DataFrame([{
                         "Data": hoje_previsto.data.strftime("%d/%m/%Y"),
+                        "Modo": modo_calculo,
                         "DAP": hoje_previsto.dap,
                         "Fase": hoje_previsto.fase,
                         "Kc": hoje_previsto.kc,
@@ -939,7 +996,7 @@ with aba2:
                         "LLI (mm)": hoje_previsto.lli_mm,
                         "LBI (mm)": hoje_previsto.lbi_mm,
                     }])
-                    st.dataframe(resumo_df, use_container_width=True)
+                    st.dataframe(resumo_df, width="stretch")
 
                     st.markdown("### Registrar decisão do dia")
 
@@ -971,6 +1028,7 @@ with aba2:
                             f_override=plantio["f_override"],
                             irrigacao_real_por_dia=irrigacao_map_atualizada,
                             modo_automatico=modo_auto,
+                            modo_calculo=modo_calculo_key,
                         )
 
                         dia_final = resultados_finais[-1]
@@ -985,7 +1043,7 @@ with aba2:
 
                     st.markdown("### Evolução até a data selecionada")
                     df_resultados = results_to_dataframe(resultados_antes)
-                    st.dataframe(df_resultados, use_container_width=True)
+                    st.dataframe(df_resultados, width="stretch")
 
             except Exception as e:
                 st.error(f"Erro ao processar operação diária: {e}")
@@ -1012,7 +1070,7 @@ with aba3:
         if hist_df.empty:
             st.warning("Esse plantio ainda não possui dias salvos.")
         else:
-            st.dataframe(hist_df, use_container_width=True)
+            st.dataframe(hist_df, width="stretch")
 
             csv_bytes = hist_df.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button(
@@ -1068,7 +1126,7 @@ with aba4:
     with subaba1:
         st.markdown("### Banco de culturas")
         culturas_df = crops_to_df()
-        st.dataframe(culturas_df, use_container_width=True)
+        st.dataframe(culturas_df, width="stretch")
 
         csv_culturas = culturas_df.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
         st.download_button(
@@ -1081,7 +1139,7 @@ with aba4:
     with subaba2:
         st.markdown("### Banco de solos")
         solos_df = load_solos_df()
-        st.dataframe(solos_df, use_container_width=True)
+        st.dataframe(solos_df, width="stretch")
 
         st.markdown("### Cadastrar novo solo")
         with st.form("form_solo"):
@@ -1152,6 +1210,15 @@ with aba5:
             key="calc_data"
         )
 
+        modo_calculo_calc = st.radio(
+            "Modo de cálculo",
+            ["FAO-56", "Planilha"],
+            horizontal=True,
+            key="calc_modo",
+            help="FAO-56 usa Z fixo da cultura. Planilha usa SR = 100 mm (Z = 0,10 m) nos primeiros 10 dias."
+        )
+        modo_calculo_calc_key = "fao56" if modo_calculo_calc == "FAO-56" else "planilha"
+
         if data_calculo < data_plantio:
             st.error("A data de referência não pode ser anterior à data de plantio.")
         else:
@@ -1176,6 +1243,7 @@ with aba5:
                     f_override=plantio["f_override"],
                     irrigacao_real_por_dia=irrigacao_map,
                     modo_automatico=True,
+                    modo_calculo=modo_calculo_calc_key,
                 )
 
                 if not resultados:
@@ -1183,13 +1251,18 @@ with aba5:
                 else:
                     r = resultados[-1]
 
-                    z_m = plantio["z_override_m"] if plantio["z_override_m"] is not None else crop.z_m
+                    z_m = compute_effective_z_m(
+                        crop=crop,
+                        dap=r.dap,
+                        modo_calculo=modo_calculo_calc_key,
+                        z_override_m=plantio["z_override_m"],
+                    )
                     f = plantio["f_override"] if plantio["f_override"] is not None else crop.fator_f
                     theta_fc = soil.ucc * soil.ds
                     theta_wp = soil.upmp * soil.ds
                     sr_mm = compute_sr_mm(z_m)
-                    kl = compute_kl(z_m)
-                    taw = compute_taw_mm(soil, z_m)
+                    kl = compute_kl_from_sr_mm(sr_mm)
+                    taw = compute_taw_mm_from_z(soil, z_m)
                     raw = compute_raw_mm(taw, f)
 
                     st.markdown("## 1. Dados usados no cálculo")
@@ -1197,6 +1270,7 @@ with aba5:
                         "Plantio": plantio["nome"],
                         "Cultura": crop.nome,
                         "Sistema de irrigação": plantio["sistema_irrigacao"],
+                        "Modo de cálculo": modo_calculo_calc,
                         "Data de plantio": data_plantio.strftime("%d/%m/%Y"),
                         "Data analisada": data_calculo.strftime("%d/%m/%Y"),
                         "DAP": r.dap,
@@ -1210,7 +1284,7 @@ with aba5:
                         "P (mm)": r.p_mm,
                         "Irrigação real (mm)": r.irrigacao_real_mm,
                     }])
-                    st.dataframe(dados_df, use_container_width=True)
+                    st.dataframe(dados_df, width="stretch")
 
                     st.markdown("## 2. Cálculos do solo")
 
@@ -1258,7 +1332,7 @@ with aba5:
                             "Explicação": "Água facilmente disponível antes de ocorrer estresse hídrico."
                         },
                     ])
-                    st.dataframe(calc_solo_df, use_container_width=True)
+                    st.dataframe(calc_solo_df, width="stretch")
 
                     st.markdown("## 3. Cálculos da cultura")
 
@@ -1314,7 +1388,7 @@ with aba5:
                             "Explicação": "Coeficiente de cultura calculado para o DAP selecionado."
                         },
                     ])
-                    st.dataframe(calc_cultura_df, use_container_width=True)
+                    st.dataframe(calc_cultura_df, width="stretch")
 
                     st.markdown("## 4. Cálculos hídricos do dia")
 
@@ -1366,7 +1440,7 @@ with aba5:
                             "Explicação": "Lâmina bruta, considerando a eficiência do sistema."
                         },
                     ])
-                    st.dataframe(calc_hidrico_df, use_container_width=True)
+                    st.dataframe(calc_hidrico_df, width="stretch")
 
                     st.markdown("## 5. Interpretação do resultado")
 
