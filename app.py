@@ -572,6 +572,99 @@ def fetch_weather_open_meteo(
 # ============================================================
 # CÁLCULOS AGRONÔMICOS
 # ============================================================
+def build_planilha_prof_df(
+    results: List[ResultDay],
+    soil: Soil,
+    crop: Crop,
+    eficiencia: float,
+    pef_mode: str = "igual_p",
+    pef_percentual: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Monta uma tabela no estilo da planilha do professor.
+
+    pef_mode:
+    - "igual_p": Pef = P
+    - "percentual": Pef = P * pef_percentual
+    """
+
+    rows = []
+
+    # TAW e RAW "do dia" já vêm em cada ResultDay
+    # Vamos reconstruir LA, DRA, DTA, DP e campos auxiliares.
+    for i, r in enumerate(results):
+        # Pef
+        if pef_mode == "percentual":
+            pef = r.p_mm * pef_percentual
+        else:
+            pef = r.p_mm
+
+        # SR em mm
+        # Como no app o SR depende de Z, e Z pode variar conforme o modo,
+        # reconstruímos a partir de Kl quando possível seria ruim.
+        # Então usamos a relação do próprio modo do dia através de TAW:
+        # TAW = 1000 * (theta_fc - theta_wp) * Z
+        theta_fc = soil.ucc * soil.ds
+        theta_wp = soil.upmp * soil.ds
+        denom = 1000.0 * max(theta_fc - theta_wp, 1e-12)
+        z_m_estimado = r.taw_mm / denom if denom > 0 else 0.0
+        sr_mm = z_m_estimado * 1000.0
+
+        # DTA e DRA
+        dta_mm = r.taw_mm
+        dra_mm = r.raw_mm
+
+        # Água armazenada
+        la_in = dta_mm if i == 0 else rows[-1]["LA f"]
+        la_antes_irrig = la_in + pef + r.irrigacao_real_mm - r.etc_mm
+        la_f = max(0.0, min(dta_mm, la_antes_irrig))
+
+        # Lâmina mínima de armazenamento antes de irrigar
+        la_mi = dta_mm - dra_mm
+
+        # Balanços
+        p_menos_etc = pef - r.etc_mm
+        p_i_menos_etc = pef + r.irrigacao_real_mm - r.etc_mm
+
+        # LLI e LBI no estilo da planilha
+        # Se LA final caiu abaixo da LA mínima, precisa repor até DTA
+        if la_f <= la_mi:
+            lli = dta_mm - la_f
+        else:
+            lli = 0.0
+
+        lbi = lli / eficiencia if eficiencia > 0 else 0.0
+
+        # Aqui estou usando a irrigação real do dia como "LLI aplicada"
+        lli_aplicada = r.irrigacao_real_mm
+
+        # DP = depleção = DTA - LA final
+        dp = dta_mm - la_f
+
+        rows.append({
+            "Data": r.data.strftime("%d/%m/%Y"),
+            "DAP": r.dap,
+            "Pef": round(pef, 3),
+            "ETo": round(r.eto_mm, 3),
+            "Kc": round(r.kc, 4),
+            "Ks": round(r.ks, 4),
+            "ETc (mm)": round(r.etc_mm, 3),
+            "SR (mm)": round(sr_mm, 3),
+            "P-ETc": round(p_menos_etc, 3),
+            "(P+I-ETc)": round(p_i_menos_etc, 3),
+            "DTA (mm)": round(dta_mm, 3),
+            "DRA (mm)": round(dra_mm, 3),
+            "LA in": round(la_in, 3),
+            "LA antes irrigação": round(la_antes_irrig, 3),
+            "LA f": round(la_f, 3),
+            "LA mi": round(la_mi, 3),
+            "LLI": round(lli, 3),
+            "LBI": round(lbi, 3),
+            "LLI aplicada": round(lli_aplicada, 3),
+            "DP": round(dp, 3),
+        })
+
+    return pd.DataFrame(rows)
 def compute_effective_z_m(
     crop: Crop,
     dap: int,
@@ -1219,6 +1312,24 @@ with aba5:
         )
         modo_calculo_calc_key = "fao56" if modo_calculo_calc == "FAO-56" else "planilha"
 
+        st.markdown("### Configuração da tabela estilo planilha")
+        c_pef1, c_pef2 = st.columns([1, 1])
+        pef_mode_label = c_pef1.selectbox(
+            "Como calcular Pef na tabela",
+            ["Igual à precipitação", "Percentual da precipitação"],
+            key="calc_pef_mode",
+        )
+        pef_mode = "igual_p" if pef_mode_label == "Igual à precipitação" else "percentual"
+        pef_percentual = c_pef2.number_input(
+            "Percentual de Pef (use 1.0 = 100%)",
+            min_value=0.0,
+            max_value=1.0,
+            value=1.0,
+            step=0.01,
+            format="%.2f",
+            key="calc_pef_percentual",
+        )
+
         if data_calculo < data_plantio:
             st.error("A data de referência não pode ser anterior à data de plantio.")
         else:
@@ -1470,7 +1581,29 @@ with aba5:
                             "Por isso ainda não há necessidade de irrigação pela regra automática."
                         )
 
-                    st.markdown("## 6. Fórmulas resumidas")
+                    st.markdown("## 6. Tabela no formato da planilha")
+
+                    eficiencia_calc = IRRIGATION_EFFICIENCY[normalize_name(plantio["sistema_irrigacao"])]
+                    df_planilha = build_planilha_prof_df(
+                        results=resultados,
+                        soil=soil,
+                        crop=crop,
+                        eficiencia=eficiencia_calc,
+                        pef_mode=pef_mode,
+                        pef_percentual=pef_percentual,
+                    )
+
+                    st.dataframe(df_planilha, width="stretch")
+
+                    csv_planilha = df_planilha.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
+                    st.download_button(
+                        "Baixar tabela estilo planilha em CSV",
+                        data=csv_planilha,
+                        file_name=f"planilha_calculos_{plantio_calc_id}.csv",
+                        mime="text/csv",
+                    )
+
+                    st.markdown("## 7. Fórmulas resumidas")
                     st.code(
                         "\n".join([
                             "θfc = Ucc × Ds",
